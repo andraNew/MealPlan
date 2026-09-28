@@ -16,6 +16,8 @@ class GraphState(TypedDict):
     input : str
     destination: str
     output: str
+    messages: List[BaseMessage]
+    mode: Literal["route", "adjust"]
 
 def logic_node(state: GraphState) -> GraphState:
     """
@@ -42,39 +44,46 @@ def logic_node(state: GraphState) -> GraphState:
         destination = 'lunch'
     
     return {**state, "destination": destination}
+
+def _run_recipe_node(state: GraphState, meal: str) -> GraphState:
+    """Shared logic for both recipe nodes: keeps history so follow-up adjustments have context."""
+    system_prompt = SystemMessage(content=(
+        f"You are a helpful assistant tasked with generating and adjusting {meal} "
+        "recipes. Use the full conversation so far, including any previous recipe "
+        "you gave, to produce an updated or new recipe that matches the user's "
+        "latest request."
+    ))
+ 
+    history = state.get("messages", [])
+    updated_history = history + [HumanMessage(content=state["input"])]
+ 
+    response = model.invoke([system_prompt] + updated_history)
+    output = response.content.strip()
+ 
+    updated_history = updated_history + [AIMessage(content=output)]
+ 
+    return {
+        **state,
+        "output": f"{meal.capitalize()} Recipe: {output}",
+        "messages": updated_history,
+        "destination": f"{meal}_node",
+    }
+
 def breakfast_node(state: GraphState) -> GraphState:
-    """
-    Generates a breakfast receipe based on the user's input.
-    """
-    system_prompt = SystemMessage(content=(
-        "You are a helpful assistant tasked with generating a breakfast receipe. \
-        Use the user's input to create a suitable breakfast receipe."
-    ))
-    human_message = HumanMessage(content=state["input"])
-
-    response = model.invoke([system_prompt, human_message])
-    output = response.content.strip()
-
-    return {**state, "output": f"Breakfast Recipe: {output}"}
-
+    return _run_recipe_node(state, "breakfast")
+ 
 def lunch_node(state: GraphState) -> GraphState:
-    """
-    Generates a lunch receipe based on the user's input.
-    """
-    system_prompt = SystemMessage(content=(
-        "You are a helpful assistant tasked with generating a lunch receipe. \
-        Use the user's input to create a suitable lunch receipe."
-    ))
-    human_message = HumanMessage(content=state["input"])
-
-    response = model.invoke([system_prompt, human_message])
-    output = response.content.strip()
-
-    return {**state, "output": f"Lunch Recipe: {output}"}  
+    return _run_recipe_node(state, "lunch") 
 
 def route_decision(state: GraphState) -> Literal["breakfast_node", "lunch_node"]:
     return state["destination"]
 
+def entry_route(state: GraphState) -> Literal["router", "breakfast_node", "lunch_node"]:
+    """On a fresh request, go through the router. On an adjustment, go straight
+    back to whichever node handled the recipe last time."""
+    if state.get("mode") == "adjust" and state.get("destination"):
+        return state["destination"]
+    return "router"
 
 def create_graph():
     workflow = StateGraph(GraphState)
@@ -82,7 +91,18 @@ def create_graph():
     workflow.add_node("breakfast_node", breakfast_node)
     workflow.add_node("lunch_node", lunch_node)
 
-    workflow.set_entry_point("router")
+    #workflow.set_entry_point("router")
+
+    workflow.add_conditional_edges(
+        START,
+        entry_route,
+        {
+            "router": "router",
+            "breakfast_node": "breakfast_node",
+            "lunch_node": "lunch_node",
+        },
+    )
+
     workflow.add_conditional_edges(
         "router",
         route_decision,
@@ -101,16 +121,29 @@ def main():
     print("--- Dimplr Logic CLI (Type 'exit' to quit) ---")
     app = create_graph()
 
+    state: GraphState = {
+        "input": "",
+        "destination": "",
+        "output": "",
+        "messages": [],
+        "mode": "route",
+    }
+
     while True:
         user_input = input("User: ")
         if user_input.lower() == "exit":
             break
 
-        state = {"input": user_input, "destination": "", "output": ""}
+        state["input"] = user_input
 
         try:
             output = app.invoke(state)
             print(f"System: {output['output']}")
+            state = output  # Update state for next iteration
+
+            follow_up= input("Do you want to adjust the recipe? (yes/no): ").strip().lower()
+            state["mode"] = "adjust" if follow_up.startswith("y") else "route"
+
         except Exception as e:
             print(f"Error: {e}")
 
